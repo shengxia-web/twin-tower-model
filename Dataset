@@ -1,0 +1,198 @@
+import json
+from pathlib import Path
+import random
+from transformers import BertTokenizer
+from torch.utils.data import Dataset
+import datasets
+
+# 配置参数
+MAX_DOC_LENGTH = 512  # BERT最大文档长度
+MAX_QUERY_LENGTH = 64  # 最大查询长度
+NEGATIVE_SAMPLES = 4  # 每个正例对应的负例数量
+DATA_CACHE_DIR = "./data_cache"  # 预处理数据缓存目录
+
+# 初始化BERT tokenizer
+tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
+
+def process_nq_dataset(data_dir, split='train'):
+    """
+    处理Natural Questions数据集
+    """
+    # 加载原始数据
+    nq = datasets.load_dataset('natural_questions', split=split, cache_dir=data_dir)
+    
+    processed_data = []
+    for example in nq:
+        # 提取问题和正例文档
+        question = example['question']['text']
+        annotations = example['annotations'][0]
+        positive_ctxs = example['document']['tokens']['token']
+        
+        # 构建正样本
+        positive_entry = {
+            'question': question,
+            'positive_ctxs': [positive_ctxs],
+            'hard_negative_ctxs': []
+        }
+        
+        # 添加负采样（这里简化实现，实际应使用BM25或随机采样）
+        negative_ctxs = random.sample(nq['document'], NEGATIVE_SAMPLES)
+        positive_entry['hard_negative_ctxs'] = [ctx['tokens']['token'] for ctx in negative_ctxs]
+        
+        processed_data.append(positive_entry)
+    
+    return processed_data
+
+def process_tqa_dataset(data_dir, split='train'):
+    """
+    处理TriviaQA数据集
+    """
+    tqa = datasets.load_dataset('trivia_qa', 'rc', split=split, data_dir=data_dir)
+    
+    processed_data = []
+    for example in tqa:
+        # 提取问题和证据段落
+        question = example['question']
+        evidence = example['evidence']['value']
+        
+        # 构建样本
+        entry = {
+            'question': question,
+            'positive_ctxs': [evidence],
+            'hard_negative_ctxs': []
+        }
+        
+        # 负采样
+        negative_samples = random.sample(tqa['evidence'], NEGATIVE_SAMPLES)
+        entry['hard_negative_ctxs'] = [s['value'] for s in negative_samples]
+        
+        processed_data.append(entry)
+    
+    return processed_data
+
+def process_wq_dataset(data_path):
+    """
+    处理WebQuestions数据集
+    """
+    with open(data_path) as f:
+        data = json.load(f)
+    
+    processed_data = []
+    for item in data:
+        question = item['question']
+        answer = item['answer']
+        
+        # 假设已关联文档数据（需根据实际数据结构调整）
+        related_docs = item.get('documents', [])
+        
+        entry = {
+            'question': question,
+            'positive_ctxs': [doc['text'] for doc in related_docs],
+            'hard_negative_ctxs': []
+        }
+        
+        # 负采样（需要外部文档集）
+        # 这里使用随机采样示例，实际应使用BM25
+        all_docs = [d['text'] for d in data if d != item]
+        entry['hard_negative_ctxs'] = random.sample(all_docs, NEGATIVE_SAMPLES)
+        
+        processed_data.append(entry)
+    
+    return processed_data
+
+class RetrievalDataset(Dataset):
+    """统一数据格式的PyTorch Dataset"""
+    def __init__(self, data, mode='train'):
+        self.data = data
+        self.mode = mode
+        
+    def __len__(self):
+        return len(self.data)
+    
+    def tokenize_text(self, text, max_length):
+        """BERT标记化处理"""
+        return tokenizer(
+            text,
+            max_length=max_length,
+            truncation=True,
+            padding='max_length',
+            return_tensors='pt'
+        )
+    
+    def __getitem__(self, idx):
+        item = self.data[idx]
+        
+        # 处理查询
+        query_enc = self.tokenize_text(item['question'], MAX_QUERY_LENGTH)
+        
+        # 处理正例文档
+        pos_doc = random.choice(item['positive_ctxs'])
+        pos_doc_enc = self.tokenize_text(pos_doc, MAX_DOC_LENGTH)
+        
+        # 处理负例文档
+        neg_docs = random.sample(item['hard_negative_ctxs'], NEGATIVE_SAMPLES)
+        neg_docs_enc = [self.tokenize_text(d, MAX_DOC_LENGTH) for d in neg_docs]
+        
+        return {
+            'query_input': query_enc,
+            'pos_doc_input': pos_doc_enc,
+            'neg_docs_input': neg_docs_enc
+        }
+
+# 使用示例 ---------------------------------------------------
+if __name__ == "__main__":
+    # 预处理并缓存数据
+    Path(DATA_CACHE_DIR).mkdir(exist_ok=True)
+    
+    # 处理NQ数据集
+    nq_train = process_nq_dataset(DATA_CACHE_DIR, 'train')
+    nq_val = process_nq_dataset(DATA_CACHE_DIR, 'validation')
+    
+    # 处理TQA数据集
+    tqa_train = process_tqa_dataset(DATA_CACHE_DIR, 'train')
+    tqa_val = process_tqa_dataset(DATA_CACHE_DIR, 'validation')
+    
+    # 处理WQ数据集（假设数据文件路径）
+    wq_data = process_wq_dataset("./webquestions.json")
+    
+    # 创建PyTorch Dataset
+    train_dataset = RetrievalDataset(nq_train + tqa_train + wq_data)
+    val_dataset = RetrievalDataset(nq_val + tqa_val)
+    
+    # 验证数据样本
+    sample = train_dataset[0]
+    print("Query input shape:", sample['query_input']['input_ids'].shape)
+    print("Positive doc shape:", sample['pos_doc_input']['input_ids'].shape)
+    print(f"Negative docs count: {len(sample['neg_docs_input'])}")
+
+高效负采样
+from rank_bm25 import BM25Okapi
+
+def build_bm25_negatives(corpus, questions, n_samples=5):
+    """使用BM25进行难负例挖掘"""
+    tokenized_corpus = [doc.split() for doc in corpus]
+    bm25 = BM25Okapi(tokenized_corpus)
+    
+    negatives = []
+    for q in questions:
+        tokenized_q = q.split()
+        scores = bm25.get_scores(tokenized_q)
+        top_n = np.argsort(scores)[-n_samples:]
+        negatives.append([corpus[i] for i in top_n])
+    
+    return negatives
+
+多进程处理
+from multiprocessing import Pool
+
+def parallel_preprocessing(data_chunk):
+    with Pool(processes=4) as pool:
+        results = pool.map(process_single_example, data_chunk)
+    return results
+
+数据验证
+def validate_sample(sample):
+    assert 'question' in sample
+    assert len(sample['positive_ctxs']) > 0
+    assert len(sample['hard_negative_ctxs']) >= NEGATIVE_SAMPLES
+    return True
