@@ -1,0 +1,133 @@
+import torch
+import torch.nn as nn
+from transformers import BertModel, BertTokenizer, AdamW
+from torch.optim import AdamW as TorchAdamW
+from transformers.models.bert.modeling_bert import BertEncoder
+
+# 设置随机种子保证可复现性
+torch.manual_seed(42)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(42)
+
+class QueryLearningLayer(nn.Module):
+    """查询学习层，使用多层Transformer结构生成模拟查询表示"""
+    def __init__(self, config):
+        super().__init__()
+        self.transformer = BertEncoder(config)
+        
+    def forward(self, hidden_states, attention_mask):
+        extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
+        extended_attention_mask = (1.0 - extended_attention_mask) * -10000.0
+        
+        for layer in self.transformer.layer:
+            hidden_states = layer(hidden_states, extended_attention_mask)[0]
+        return hidden_states
+
+class EarlyInteractionLayer(nn.Module):
+    """早期交互层，通过交叉注意力融合文档和查询表示"""
+    def __init__(self, d_model=768, n_heads=12):
+        super().__init__()
+        self.cross_attn = nn.MultiheadAttention(d_model, n_heads)
+        self.layer_norm = nn.LayerNorm(d_model)
+        
+    def forward(self, doc_embed, query_embed):
+        attn_output, _ = self.cross_attn(
+            query=query_embed.transpose(0, 1),
+            key=doc_embed.transpose(0, 1),
+            value=doc_embed.transpose(0, 1)
+        )
+        return self.layer_norm(attn_output.transpose(0, 1) + query_embed)
+
+class OptimizedTwinTower(nn.Module):
+    """优化的双塔模型"""
+    def __init__(self, bert_model='bert-base-uncased', lambda_weight=0.8):
+        super().__init__()
+        self.bert = BertModel.from_pretrained(bert_model)
+        self.config = self.bert.config
+        
+        # 文档编码器
+        self.doc_encoder = BertEncoder(self.config)
+        # 查询编码器
+        self.query_encoder = BertEncoder(self.config)
+        
+        # 查询学习层（6层Transformer）
+        self.query_learner = QueryLearningLayer(self.config)
+        # 早期交互层
+        self.early_interaction = EarlyInteractionLayer()
+        
+        # 损失函数参数
+        self.lambda_weight = lambda_weight
+        self.recon_loss = nn.CrossEntropyLoss()
+        
+    def forward(self, doc_input, query_input):
+        # 文档编码
+        doc_embeds = self.bert(**doc_input).last_hidden_state
+        doc_embeds = self.doc_encoder(doc_embeds)[0]
+        
+        # 查询编码
+        query_embeds = self.bert(**query_input).last_hidden_state
+        query_embeds = self.query_encoder(query_embeds)[0]
+        
+        # 生成模拟查询
+        pseudo_query = self.query_learner(doc_embeds, doc_input['attention_mask'])
+        
+        # 早期交互
+        fused_embeds = self.early_interaction(doc_embeds, pseudo_query)
+        
+        # 相似度计算
+        similarity = torch.matmul(fused_embeds, query_embeds.transpose(1, 2))
+        
+        return similarity
+
+    def compute_loss(self, scores, labels, recon_labels):
+        # 排名损失
+        margin = 1.0
+        pos_scores = scores[:, 0]
+        neg_scores = scores[:, 1:]
+        rank_loss = torch.mean(torch.clamp(neg_scores - pos_scores + margin, min=0))
+        
+        # 重构损失
+        recon_loss = self.recon_loss(recon_labels)
+        
+        # 组合损失
+        return self.lambda_weight * rank_loss + (1 - self.lambda_weight) * recon_loss
+
+# 训练配置
+config = {
+    "learning_rate": 3e-5,
+    "batch_size": 32,
+    "epochs": 3,
+    "max_doc_length": 512,
+    "max_query_length": 64,
+    "grad_clip": 1.0,
+    "dropout": 0.1
+}
+
+# 初始化模型
+model = OptimizedTwinTower()
+tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
+
+# 优化器设置
+optimizer = TorchAdamW(model.parameters(), lr=config['learning_rate'])
+
+# 示例训练循环
+def train_step(batch):
+    model.train()
+    doc_inputs = tokenizer(batch['doc_text'], padding='max_length', 
+                          max_length=512, return_tensors='pt')
+    query_inputs = tokenizer(batch['query_text'], padding='max_length',
+                            max_length=64, return_tensors='pt')
+    
+    scores = model(doc_inputs, query_inputs)
+    loss = model.compute_loss(scores, batch['labels'], batch['recon_labels'])
+    
+    # 梯度裁剪
+    torch.nn.utils.clip_grad_norm_(model.parameters(), config['grad_clip'])
+    
+    optimizer.zero_grad()
+    loss.backward()
+    optimizer.step()
+    return loss.item()
+
+# 数据加载和训练循环需要根据实际数据集实现
+# 需要实现早停机制和验证逻辑
