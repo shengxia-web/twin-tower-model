@@ -1,0 +1,205 @@
+import torch
+import torch.nn as nn
+from transformers import BertConfig
+from torch.nn import TransformerEncoder, TransformerEncoderLayer
+
+class QueryLearningLayer(nn.Module):
+    """基于Transformer的查询学习层"""
+    def __init__(self, 
+                 hidden_dim=768,
+                 num_layers=6,
+                 n_heads=12,
+                 dropout=0.1,
+                 max_query_length=64):
+        super().__init__()
+        
+        # Transformer配置
+        self.config = BertConfig(
+            hidden_size=hidden_dim,
+            num_hidden_layers=num_layers,
+            num_attention_heads=n_heads,
+            intermediate_size=hidden_dim*4,
+            hidden_dropout_prob=dropout,
+            attention_probs_dropout_prob=dropout
+        )
+        
+        # 初始化可学习的查询向量（[CLS] token）
+        self.query_embeddings = nn.Parameter(
+            torch.randn(1, max_query_length, hidden_dim)
+        )
+        
+        # Transformer编码器层
+        self.transformer_layers = nn.ModuleList([
+            TransformerEncoderLayer(
+                d_model=hidden_dim,
+                nhead=n_heads,
+                dim_feedforward=hidden_dim*4,
+                dropout=dropout,
+                activation='gelu'
+            ) for _ in range(num_layers)
+        ])
+        
+        # 交叉注意力层（文档到查询）
+        self.cross_attention = nn.MultiheadAttention(
+            embed_dim=hidden_dim,
+            num_heads=n_heads,
+            dropout=dropout
+        )
+        
+        # 层标准化
+        self.layer_norm = nn.LayerNorm(hidden_dim)
+        self.final_proj = nn.Linear(hidden_dim, hidden_dim)
+
+    def forward(self, document_embeds, doc_attention_mask):
+        """
+        输入:
+            document_embeds: [batch_size, doc_seq_len, hidden_dim]
+            doc_attention_mask: [batch_size, doc_seq_len]
+        输出:
+            simulated_queries: [batch_size, query_seq_len, hidden_dim]
+        """
+        batch_size = document_embeds.size(0)
+        
+        # 初始化查询向量
+        query_vectors = self.query_embeddings.repeat(batch_size, 1, 1)
+        
+        # 文档编码处理
+        doc_key_padding_mask = (doc_attention_mask == 0)
+        document_embeds = document_embeds.transpose(0, 1)  # [seq_len, batch, dim]
+        
+        # 多层Transformer处理
+        for layer in self.transformer_layers:
+            query_vectors = layer(
+                src=query_vectors.transpose(0, 1),  # [seq_len, batch, dim]
+                src_key_padding_mask=None
+            ).transpose(0, 1)
+            
+            # 交叉注意力机制
+            attn_output, _ = self.cross_attention(
+                query=query_vectors.transpose(0, 1),
+                key=document_embeds,
+                value=document_embeds,
+                key_padding_mask=doc_key_padding_mask
+            )
+            query_vectors = self.layer_norm(attn_output.transpose(0, 1) + query_vectors)
+        
+        # 最终投影
+        simulated_queries = self.final_proj(query_vectors)
+        return simulated_queries
+
+class EnhancedQueryLearner(QueryLearningLayer):
+    """增强版查询学习层，包含动态掩码生成"""
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.query_length_predictor = nn.Sequential(
+            nn.Linear(kwargs['hidden_dim'], 256),
+            nn.ReLU(),
+            nn.Linear(256, kwargs['max_query_length'])
+        )
+        
+    def dynamic_mask(self, document_embeds):
+        """动态生成查询长度掩码"""
+        length_logits = self.query_length_predictor(document_embeds.mean(dim=1))
+        lengths = torch.sigmoid(length_logits).argmax(dim=1)
+        
+        # 生成二进制掩码
+        mask = torch.arange(self.max_query_length, device=document_embeds.device)
+        mask = mask.unsqueeze(0) < lengths.unsqueeze(1)
+        return mask.float()
+    
+    def forward(self, document_embeds, doc_attention_mask):
+        sim_queries = super().forward(document_embeds, doc_attention_mask)
+        
+        # 应用动态长度掩码
+        length_mask = self.dynamic_mask(document_embeds).unsqueeze(-1)
+        return sim_queries * length_mask
+
+# 测试代码 ---------------------------------------------------
+if __name__ == "__main__":
+    # 参数配置
+    batch_size = 4
+    doc_seq_len = 512
+    hidden_dim = 768
+    
+    # 初始化层
+    query_learner = QueryLearningLayer(
+        hidden_dim=hidden_dim,
+        num_layers=6,
+        n_heads=12,
+        max_query_length=64
+    )
+    
+    # 模拟输入
+    doc_embeds = torch.randn(batch_size, doc_seq_len, hidden_dim)
+    doc_mask = torch.ones(batch_size, doc_seq_len)
+    
+    # 前向传播
+    simulated_queries = query_learner(doc_embeds, doc_mask)
+    
+    print("输入文档嵌入形状:", doc_embeds.shape)        # [4, 512, 768]
+    print("输出模拟查询形状:", simulated_queries.shape)  # [4, 64, 768]
+
+混合注意力机制
+class HybridAttentionLearner(QueryLearningLayer):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.coattention = nn.MultiheadAttention(
+            embed_dim=kwargs['hidden_dim'],
+            num_heads=kwargs['n_heads']
+        )
+        
+    def forward(self, document_embeds, doc_mask):
+        # 原始处理流程
+        base_output = super().forward(document_embeds, doc_mask)
+        
+        # 混合注意力增强
+        co_attn, _ = self.coattention(
+            query=base_output.transpose(0, 1),
+            key=document_embeds.transpose(0, 1),
+            value=document_embeds.transpose(0, 1)
+        )
+        return base_output + co_attn.transpose(0, 1)
+
+多粒度查询生成
+class MultiScaleQueryLearner(QueryLearningLayer):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.scale_projections = nn.ModuleList([
+            nn.Linear(kwargs['hidden_dim'], kwargs['hidden_dim'])
+            for _ in range(3)
+        ])
+        
+    def forward(self, document_embeds, doc_mask):
+        base_queries = super().forward(document_embeds, doc_mask)
+        
+        # 多尺度特征
+        multi_scale = []
+        for proj in self.scale_projections:
+            scale_feat = proj(base_queries)
+            multi_scale.append(nn.functional.max_pool1d(
+                scale_feat.transpose(1,2), kernel_size=3, stride=2
+            ).transpose(1,2))
+            
+        return torch.cat(multi_scale, dim=1)
+
+记忆增强机制
+class MemoryEnhancedLearner(QueryLearningLayer):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.memory_bank = nn.Parameter(
+            torch.randn(100, kwargs['hidden_dim'])
+        )
+        self.memory_attention = nn.MultiheadAttention(
+            kwargs['hidden_dim'], kwargs['n_heads'])
+        
+    def forward(self, document_embeds, doc_mask):
+        base_queries = super().forward(document_embeds, doc_mask)
+        
+        # 记忆增强
+        mem_attn, _ = self.memory_attention(
+            query=base_queries.transpose(0,1),
+            key=self.memory_bank.unsqueeze(0).repeat(base_queries.size(0),1,1),
+            value=self.memory_bank.unsqueeze(0).repeat(base_queries.size(0),1,1)
+        )
+        return base_queries + mem_attn.transpose(0,1)
+
