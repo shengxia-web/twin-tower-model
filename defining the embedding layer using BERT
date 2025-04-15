@@ -1,0 +1,134 @@
+import torch
+import torch.nn as nn
+from transformers import BertModel, BertTokenizer, BertConfig
+
+class BERTEmbeddingLayer(nn.Module):
+    """基于BERT的嵌入层，支持双塔独立编码"""
+    def __init__(self, 
+                 model_name='bert-base-uncased',
+                 doc_max_length=512, 
+                 query_max_length=64,
+                 freeze_bert=False):
+        super().__init__()
+        self.config = BertConfig.from_pretrained(model_name)
+        self.tokenizer = BertTokenizer.from_pretrained(model_name)
+        
+        # 初始化双BERT编码器
+        self.doc_bert = BertModel.from_pretrained(model_name)
+        self.query_bert = BertModel.from_pretrained(model_name)
+        
+        # 控制最大长度
+        self.doc_max_length = doc_max_length
+        self.query_max_length = query_max_length
+        
+        # 是否冻结BERT参数
+        if freeze_bert:
+            for param in self.doc_bert.parameters():
+                param.requires_grad = False
+            for param in self.query_bert.parameters():
+                param.requires_grad = False
+
+    def tokenize(self, texts, max_length, is_query=False):
+        """统一tokenization处理"""
+        return self.tokenizer(
+            texts,
+            max_length=max_length,
+            truncation=True,
+            padding='max_length' if is_query else 'longest',
+            return_tensors='pt'
+        )
+
+    def encode_document(self, documents):
+        """文档编码流程"""
+        inputs = self.tokenize(documents, self.doc_max_length)
+        outputs = self.doc_bert(
+            input_ids=inputs['input_ids'].to(self.device),
+            attention_mask=inputs['attention_mask'].to(self.device)
+        )
+        return outputs.last_hidden_state  # [batch_size, seq_len, hidden_dim]
+
+    def encode_query(self, queries):
+        """查询编码流程""" 
+        inputs = self.tokenize(queries, self.query_max_length, is_query=True)
+        outputs = self.query_bert(
+            input_ids=inputs['input_ids'].to(self.device),
+            attention_mask=inputs['attention_mask'].to(self.device)
+        )
+        return outputs.last_hidden_state  # [batch_size, seq_len, hidden_dim]
+
+    def forward(self, documents, queries):
+        """完整前向过程"""
+        doc_embeddings = self.encode_document(documents)  # 文档嵌入
+        query_embeddings = self.encode_query(queries)     # 查询嵌入
+        return doc_embeddings, query_embeddings
+
+    @property
+    def device(self):
+        return next(self.parameters()).device
+
+# 使用示例 ---------------------------------------------------
+if __name__ == "__main__":
+    # 初始化嵌入层
+    embed_layer = BERTEmbeddingLayer()
+    
+    # 示例输入
+    documents = [
+        "The quick brown fox jumps over the lazy dog.",
+        "Natural language processing enables computers to understand human language."
+    ]
+    queries = [
+        "What animal jumps over the dog?",
+        "What technology understands human language?"
+    ]
+    
+    # 获取嵌入
+    doc_embeds, query_embeds = embed_layer(documents, queries)
+    
+    print("Document embeddings shape:", doc_embeds.shape)  # [2, 512, 768]
+    print("Query embeddings shape:", query_embeds.shape)    # [2, 64, 768]
+
+池化层增强
+class BERTEmbeddingWithPooling(BERTEmbeddingLayer):
+    """添加动态池化层的增强版本"""
+    def __init__(self, pooling_mode='mean', **kwargs):
+        super().__init__(**kwargs)
+        self.pooling_mode = pooling_mode
+        
+    def pool_embeddings(self, embeddings, attention_mask):
+        if self.pooling_mode == 'mean':
+            input_mask_expanded = attention_mask.unsqueeze(-1).expand(embeddings.size()).float()
+            sum_embeddings = torch.sum(embeddings * input_mask_expanded, 1)
+            sum_mask = torch.clamp(input_mask_expanded.sum(1), min=1e-9)
+            return sum_embeddings / sum_mask
+        elif self.pooling_mode == 'cls':
+            return embeddings[:, 0, :]
+        else:
+            raise ValueError(f"Unsupported pooling mode: {self.pooling_mode}")
+
+    def encode_document(self, documents):
+        hidden_states = super().encode_document(documents)
+        return self.pool_embeddings(hidden_states, inputs['attention_mask'])
+
+混合精度训练支持
+from torch.cuda.amp import autocast
+
+class FP16ReadyBERTEmbedding(BERTEmbeddingLayer):
+    @autocast()
+    def encode_document(self, documents):
+        return super().encode_document(documents)
+    
+    @autocast()
+    def encode_query(self, queries):
+        return super().encode_query(queries)
+
+缓存机制加速
+from functools import lru_cache
+
+class CachedBERTEmbedding(BERTEmbeddingLayer):
+    @lru_cache(maxsize=1024)
+    def encode_document(self, document_text: str):
+        return super().encode_document([document_text])[0]
+    
+    @lru_cache(maxsize=1024)
+    def encode_query(self, query_text: str):
+        return super().encode_query([query_text])[0]
