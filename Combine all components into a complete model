@@ -12,7 +12,7 @@ class OptimizedTwinTower(nn.Module):
                  dropout=0.1,
                  lambda_weight=0.8):
         super().__init__()
-        
+
         # 初始化基础组件
         self.bert_config = BertConfig.from_pretrained(bert_model)
         self.tokenizer = BertTokenizer.from_pretrained(bert_model)
