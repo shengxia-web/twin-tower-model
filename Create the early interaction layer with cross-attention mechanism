@@ -1,0 +1,226 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class CrossAttentionInteraction(nn.Module):
+    """早期交互层核心实现"""
+    def __init__(self, 
+                 hidden_dim=768, 
+                 num_heads=12,
+                 dropout=0.1,
+                 use_residual=True):
+        super().__init__()
+        
+        # 交叉注意力机制
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=hidden_dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True
+        )
+        
+        # 层标准化与投影
+        self.norm1 = nn.LayerNorm(hidden_dim)
+        self.norm2 = nn.LayerNorm(hidden_dim)
+        self.dropout = nn.Dropout(dropout)
+        self.residual = use_residual
+        
+        # 门控融合机制
+        self.gate = nn.Sequential(
+            nn.Linear(2*hidden_dim, hidden_dim),
+            nn.Sigmoid()
+        )
+        self.final_proj = nn.Linear(hidden_dim, hidden_dim)
+
+    def forward(self, doc_embeds, query_embeds, doc_mask=None):
+        """
+        输入:
+            doc_embeds: [batch_size, doc_len, hidden_dim]
+            query_embeds: [batch_size, query_len, hidden_dim]
+            doc_mask: [batch_size, doc_len] (可选)
+        输出:
+            fused_embeds: [batch_size, doc_len, hidden_dim]
+        """
+        # 保存残差连接
+        residual = doc_embeds
+        
+        # 计算交叉注意力
+        attn_output, _ = self.cross_attn(
+            query=doc_embeds,       # 文档作为查询
+            key=query_embeds,       # 查询作为键
+            value=query_embeds,     # 查询作为值
+            key_padding_mask=doc_mask if doc_mask is not None else None
+        )
+        
+        # 门控融合
+        combined = torch.cat([doc_embeds, attn_output], dim=-1)
+        gate = self.gate(combined)
+        fused = gate * doc_embeds + (1 - gate) * attn_output
+        
+        # 标准化与投影
+        fused = self.norm1(fused)
+        fused = self.final_proj(fused)
+        
+        # 残差连接
+        if self.residual:
+            fused = fused + residual
+        
+        return self.norm2(fused)
+
+class MultiScaleCrossAttention(nn.Module):
+    """多尺度交叉注意力增强版"""
+    def __init__(self, hidden_dim=768, num_heads=12, scales=[1, 3, 5]):
+        super().__init__()
+        
+        # 多尺度卷积
+        self.conv_layers = nn.ModuleList([
+            nn.Conv1d(hidden_dim, hidden_dim, kernel_size=s, padding=s//2)
+            for s in scales
+        ])
+        
+        # 并行注意力头
+        self.attn_heads = nn.ModuleList([
+            CrossAttentionInteraction(hidden_dim, num_heads) 
+            for _ in scales
+        ])
+        
+        # 融合层
+        self.fusion = nn.Linear(len(scales)*hidden_dim, hidden_dim)
+
+    def forward(self, doc_embeds, query_embeds, doc_mask=None):
+        # 多尺度特征提取
+        doc_features = [conv(doc_embeds.transpose(1,2)).transpose(1,2) 
+                      for conv in self.conv_layers]
+        
+        # 并行注意力计算
+        attn_outputs = []
+        for feat, attn in zip(doc_features, self.attn_heads):
+            output = attn(feat, query_embeds, doc_mask)
+            attn_outputs.append(output)
+        
+        # 特征拼接与融合
+        combined = torch.cat(attn_outputs, dim=-1)
+        return self.fusion(combined)
+
+class EarlyInteractionLayer(nn.Module):
+    """完整早期交互层实现"""
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        
+        # 核心交互模块
+        self.cross_attn_layer = CrossAttentionInteraction(
+            hidden_dim=config.hidden_dim,
+            num_heads=config.num_heads,
+            dropout=config.dropout
+        )
+        
+        # 辅助增强模块
+        self.context_enhancer = nn.GRU(
+            input_size=config.hidden_dim,
+            hidden_size=config.hidden_dim//2,
+            bidirectional=True,
+            batch_first=True
+        )
+        
+        # 初始化参数
+        self._init_weights()
+
+    def _init_weights(self):
+        # 正交初始化GRU参数
+        for name, param in self.context_enhancer.named_parameters():
+            if 'weight_hh' in name:
+                nn.init.orthogonal_(param)
+            elif 'weight_ih' in name:
+                nn.init.xavier_uniform_(param)
+            elif 'bias' in name:
+                nn.init.zeros_(param)
+
+    def forward(self, doc_embeds, pseudo_queries, doc_mask=None):
+        """
+        输入:
+            doc_embeds: 文档嵌入 [B, L, D]
+            pseudo_queries: 模拟查询 [B, Q, D]
+            doc_mask: 文档掩码 [B, L]
+        输出:
+            增强后的文档表示 [B, L, D]
+        """
+        # 基础交叉注意力
+        attn_output = self.cross_attn_layer(doc_embeds, pseudo_queries, doc_mask)
+        
+        # 上下文增强
+        context_aware, _ = self.context_enhancer(attn_output)
+        
+        # 特征融合
+        return attn_output + context_aware
+
+# 测试代码 ---------------------------------------------------
+if __name__ == "__main__":
+    # 配置参数
+    class Config:
+        hidden_dim = 768
+        num_heads = 12
+        dropout = 0.1
+
+    # 初始化模块
+    interaction_layer = EarlyInteractionLayer(Config())
+    
+    # 模拟输入
+    batch_size = 4
+    doc_len = 512
+    query_len = 64
+    doc_embeds = torch.randn(batch_size, doc_len, Config.hidden_dim)
+    pseudo_queries = torch.randn(batch_size, query_len, Config.hidden_dim)
+    doc_mask = torch.ones(batch_size, doc_len)
+    
+    # 前向传播测试
+    output = interaction_layer(doc_embeds, pseudo_queries, doc_mask)
+    
+    print("输入文档形状:", doc_embeds.shape)        # [4, 512, 768]
+    print("输出文档形状:", output.shape)            # [4, 512, 768]
+    print("梯度检查:", output.requires_grad)       # True
+
+    # 多尺度版本测试
+    multi_scale_layer = MultiScaleCrossAttention()
+    ms_output = multi_scale_layer(doc_embeds, pseudo_queries)
+    print("多尺度输出形状:", ms_output.shape)      # [4, 512, 768]
+
+稀疏注意力优化
+class SparseCrossAttention(CrossAttentionInteraction):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.sparsity_threshold = 0.1
+        
+    def forward(self, doc_embeds, query_embeds, doc_mask=None):
+        attn_output, attn_weights = self.cross_attn(
+            query=doc_embeds,
+            key=query_embeds,
+            value=query_embeds,
+            key_padding_mask=doc_mask
+        )
+        
+        # 应用稀疏化
+        mask = (attn_weights < self.sparsity_threshold)
+        attn_weights = attn_weights.masked_fill(mask, 0)
+        return torch.bmm(attn_weights, query_embeds)
+
+混合精度支持
+from torch.cuda.amp import autocast
+
+class FP16ReadyInteraction(EarlyInteractionLayer):
+    @autocast()
+    def forward(self, doc_embeds, pseudo_queries, doc_mask=None):
+        return super().forward(doc_embeds, pseudo_queries, doc_mask)
+
+缓存机制
+class CachedInteraction(nn.Module):
+    def __init__(self, base_layer):
+        super().__init__()
+        self.base_layer = base_layer
+        self.cache = {}
+        
+    def forward(self, doc_embeds, pseudo_queries, doc_mask=None):
+        cache_key = hash((doc_embeds.shape, pseudo_queries.shape))
+        if cache_key not in self.cache:
+            self.cache[cache_key] = self.base_layer(doc_embeds, pseudo_queries, doc_mask)
+        return self.cache[cache_key]
