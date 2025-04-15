@@ -1,0 +1,197 @@
+import torch
+from torch.utils.data import DataLoader
+from torch.optim import AdamW
+from torch.cuda.amp import GradScaler, autocast
+from tqdm import tqdm
+import numpy as np
+
+class Trainer:
+    def __init__(self, model, train_loader, val_loader, config):
+        self.model = model
+        self.train_loader = train_loader
+        self.val_loader = val_loader
+        self.config = config
+        
+        # 初始化优化器
+        self.optimizer = AdamW(
+            model.parameters(),
+            lr=config['learning_rate'],
+            weight_decay=config['weight_decay']
+        )
+        
+        # 混合精度训练
+        self.scaler = GradScaler(enabled=config['use_fp16'])
+        
+        # 学习率调度器
+        self.scheduler = torch.optim.lr_scheduler.OneCycleLR(
+            self.optimizer,
+            max_lr=config['learning_rate'],
+            total_steps=config['epochs'] * len(train_loader),
+            pct_start=config['warmup_ratio']
+        )
+        
+        # 设备配置
+        self.device = torch.device(config['device'])
+        self.model.to(self.device)
+        
+        # 训练状态跟踪
+        self.best_metric = 0.0
+        self.train_loss = []
+        self.val_metrics = []
+
+    def train_epoch(self, epoch):
+        self.model.train()
+        epoch_loss = 0.0
+        progress_bar = tqdm(self.train_loader, desc=f"Training Epoch {epoch}")
+        
+        for batch_idx, batch in enumerate(progress_bar):
+            # 数据转移到设备
+            doc_input = {k: v.to(self.device) for k, v in batch['doc_input'].items()}
+            query_input = {k: v.to(self.device) for k, v in batch['query_input'].items()}
+            labels = {k: v.to(self.device) for k, v in batch['labels'].items()}
+            
+            # 混合精度前向传播
+            with autocast(enabled=self.config['use_fp16']):
+                scores, pseudo_queries = self.model(doc_input, query_input)
+                loss_dict = self.model.compute_loss(scores, pseudo_queries, labels)
+                loss = loss_dict['total_loss']
+            
+            # 反向传播与优化
+            self.scaler.scale(loss).backward()
+            
+            # 梯度裁剪
+            if self.config['grad_clip'] > 0:
+                self.scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(
+                    self.model.parameters(),
+                    self.config['grad_clip']
+                )
+            
+            # 参数更新
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+            self.optimizer.zero_grad()
+            self.scheduler.step()
+            
+            # 记录损失
+            epoch_loss += loss.item()
+            progress_bar.set_postfix({
+                'loss': f"{loss.item():.4f}",
+                'lr': f"{self.scheduler.get_last_lr()[0]:.2e}"
+            })
+        
+        return epoch_loss / len(self.train_loader)
+
+    @torch.no_grad()
+    def evaluate(self, epoch):
+        self.model.eval()
+        total_top1 = 0
+        total_top5 = 0
+        total_samples = 0
+        val_loss = 0.0
+        
+        progress_bar = tqdm(self.val_loader, desc=f"Validation Epoch {epoch}")
+        
+        for batch in progress_bar:
+            # 数据转移到设备
+            doc_input = {k: v.to(self.device) for k, v in batch['doc_input'].items()}
+            query_input = {k: v.to(self.device) for k, v in batch['query_input'].items()}
+            labels = {k: v.to(self.device) for k, v in batch['labels'].items()}
+            
+            # 前向计算
+            scores, pseudo_queries = self.model(doc_input, query_input)
+            loss_dict = self.model.compute_loss(scores, pseudo_queries, labels)
+            
+            # 计算Top-K准确率
+            batch_size = scores.size(0)
+            _, top5_preds = torch.topk(scores, k=5, dim=1)
+            correct_top1 = (top5_preds[:, 0] == torch.arange(batch_size, device=self.device)).sum().item()
+            correct_top5 = (top5_preds == torch.arange(batch_size, device=self.device).unsqueeze(1)).any(dim=1).sum().item()
+            
+            total_top1 += correct_top1
+            total_top5 += correct_top5
+            total_samples += batch_size
+            val_loss += loss_dict['total_loss'].item()
+            
+            progress_bar.set_postfix({
+                'top1': f"{total_top1/total_samples:.2%}",
+                'top5': f"{total_top5/total_samples:.2%}"
+            })
+        
+        avg_loss = val_loss / len(self.val_loader)
+        top1_acc = total_top1 / total_samples
+        top5_acc = total_top5 / total_samples
+        
+        return {
+            'val_loss': avg_loss,
+            'top1': top1_acc,
+            'top5': top5_acc
+        }
+
+    def train(self):
+        for epoch in range(self.config['epochs']):
+            # 训练阶段
+            train_loss = self.train_epoch(epoch)
+            self.train_loss.append(train_loss)
+            
+            # 验证阶段
+            val_metrics = self.evaluate(epoch)
+            self.val_metrics.append(val_metrics)
+            
+            # 保存最佳模型
+            if val_metrics['top1'] > self.best_metric:
+                self.best_metric = val_metrics['top1']
+                torch.save({
+                    'epoch': epoch,
+                    'model_state_dict': self.model.state_dict(),
+                    'optimizer_state_dict': self.optimizer.state_dict(),
+                    'best_metric': self.best_metric,
+                }, f"best_model_epoch{epoch}.pt")
+            
+            # 输出日志
+            print(f"\nEpoch {epoch} Summary:")
+            print(f"Train Loss: {train_loss:.4f}")
+            print(f"Val Loss: {val_metrics['val_loss']:.4f}")
+            print(f"Top-1 Acc: {val_metrics['top1']:.2%}")
+            print(f"Top-5 Acc: {val_metrics['top5']:.2%}\n")
+
+# 配置示例
+config = {
+    'learning_rate': 3e-5,
+    'weight_decay': 0.01,
+    'epochs': 5,
+    'warmup_ratio': 0.1,
+    'grad_clip': 1.0,
+    'batch_size': 32,
+    'use_fp16': True,
+    'device': 'cuda' if torch.cuda.is_available() else 'cpu'
+}
+
+# 使用示例 ---------------------------------------------------
+if __name__ == "__main__":
+    # 初始化组件
+    model = OptimizedTwinTower()
+    tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
+    
+    # 加载数据集（示例）
+    train_dataset = RetrievalDataset(...)
+    val_dataset = RetrievalDataset(...)
+    
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=config['batch_size'],
+        shuffle=True,
+        collate_fn=lambda x: x  # 需要自定义collate_fn处理批次
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=config['batch_size'],
+        collate_fn=lambda x: x
+    )
+    
+    # 初始化训练器
+    trainer = Trainer(model, train_loader, val_loader, config)
+    
+    # 开始训练
+    trainer.train()
+
