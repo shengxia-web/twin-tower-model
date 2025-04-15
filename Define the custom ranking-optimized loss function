@@ -1,0 +1,161 @@
+import torch
+import torch.nn as nn
+
+class RankingOptimizedLoss(nn.Module):
+    """
+    排序优化损失函数实现
+    论文公式(12)：L = sum_neg log(1 + exp(-s_neg/γ)) + sum_pos log(1 + exp(s_pos/γ))
+    """
+    def __init__(self, temperature=0.1, margin=0.0, reduction='mean'):
+        """
+        Args:
+            temperature (float): 温度系数γ，控制相似度分布的陡峭程度 (默认: 0.1)
+            margin (float): 相似度边际值，增强正负样本区分度 (默认: 0.0)
+            reduction (str): 损失聚合方式 ['none'|'mean'|'sum'] (默认: 'mean')
+        """
+        super().__init__()
+        self.temperature = temperature
+        self.margin = margin
+        self.reduction = reduction
+        
+        # 数值稳定参数
+        self.epsilon = 1e-8
+        
+    def forward(self, pos_scores, neg_scores):
+        """
+        前向计算
+        Args:
+            pos_scores (Tensor): 正样本相似度分数 [batch_size, num_pos]
+            neg_scores (Tensor): 负样本相似度分数 [batch_size, num_neg]
+        Returns:
+            loss (Tensor): 计算得到的损失值
+        """
+        # 维度校验
+        assert pos_scores.dim() == 2 and neg_scores.dim() == 2
+        assert pos_scores.size(0) == neg_scores.size(0)
+        
+        # 计算正样本损失项
+        pos_loss = self._compute_positive_loss(pos_scores)
+        
+        # 计算负样本损失项
+        neg_loss = self._compute_negative_loss(neg_scores)
+        
+        # 组合损失
+        total_loss = pos_loss + neg_loss
+        
+        # 聚合方式处理
+        if self.reduction == 'mean':
+            return total_loss.mean()
+        elif self.reduction == 'sum':
+            return total_loss.sum()
+        else:
+            return total_loss
+    
+    def _compute_positive_loss(self, scores):
+        """正样本损失项计算"""
+        scaled_scores = (scores - self.margin) / self.temperature
+        # 数值稳定处理：log(1 + exp(x)) = max(x, 0) - x * z + log(1 + exp(-|x|))
+        max_val = torch.clamp(-scaled_scores, min=0)
+        loss = max_val + scaled_scores * (scaled_scores <= 0).float() + \
+               torch.log1p(torch.exp(-torch.abs(scaled_scores)) + self.epsilon
+        return loss.sum(dim=1)
+    
+    def _compute_negative_loss(self, scores):
+        """负样本损失项计算"""
+        scaled_scores = (-scores - self.margin) / self.temperature
+        # 使用相同数值稳定公式
+        max_val = torch.clamp(-scaled_scores, min=0)
+        loss = max_val + scaled_scores * (scaled_scores <= 0).float() + \
+               torch.log1p(torch.exp(-torch.abs(scaled_scores)) + self.epsilon
+        return loss.sum(dim=1)
+
+    def extra_repr(self):
+        return f'temperature={self.temperature}, margin={self.margin}, reduction={self.reduction}'
+
+class HybridRankingLoss(nn.Module):
+    """组合损失函数（排名损失 + 查询重构损失）"""
+    def __init__(self, rank_weight=0.8, **kwargs):
+        super().__init__()
+        self.ranking_loss = RankingOptimizedLoss(**kwargs)
+        self.recon_loss = nn.CrossEntropyLoss()
+        self.rank_weight = rank_weight
+        
+    def forward(self, pos_scores, neg_scores, recon_pred, recon_target):
+        """
+        Args:
+            pos_scores: 正样本相似度分数
+            neg_scores: 负样本相似度分数
+            recon_pred: 查询重构预测 [batch_size, seq_len, vocab_size]
+            recon_target: 重构目标 [batch_size, seq_len]
+        """
+        # 计算排名损失
+        rank_loss = self.ranking_loss(pos_scores, neg_scores)
+        
+        # 计算重构损失
+        recon_loss = self.recon_loss(
+            recon_pred.view(-1, recon_pred.size(-1)), 
+            recon_target.view(-1)
+        )
+        
+        # 组合损失
+        return self.rank_weight * rank_loss + (1 - self.rank_weight) * recon_loss
+
+# 测试代码 ---------------------------------------------------
+if __name__ == "__main__":
+    # 参数设置
+    batch_size = 32
+    num_pos = 1    # 每个样本的正例数
+    num_neg = 4    # 每个样本的负例数
+    vocab_size = 30522  # BERT词汇表大小
+    
+    # 模拟输入
+    pos_scores = torch.randn(batch_size, num_pos).sigmoid()  # 假设相似度在0-1之间
+    neg_scores = torch.randn(batch_size, num_neg).sigmoid()
+    recon_pred = torch.randn(batch_size, 64, vocab_size)     # 假设序列长度64
+    recon_target = torch.randint(0, vocab_size, (batch_size, 64))
+    
+    # 初始化损失函数
+    base_loss_fn = RankingOptimizedLoss(temperature=0.1, reduction='mean')
+    hybrid_loss_fn = HybridRankingLoss(rank_weight=0.8, temperature=0.1)
+    
+    # 计算基础损失
+    base_loss = base_loss_fn(pos_scores, neg_scores)
+    print(f"Base loss: {base_loss.item():.4f}")
+    
+    # 计算混合损失
+    hybrid_loss = hybrid_loss_fn(pos_scores, neg_scores, recon_pred, recon_target)
+    print(f"Hybrid loss: {hybrid_loss.item():.4f}")
+
+难例挖掘增强
+class HardMiningRankingLoss(RankingOptimizedLoss):
+    def __init__(self, topk=3, **kwargs):
+        super().__init__(**kwargs)
+        self.topk = topk
+        
+    def _compute_negative_loss(self, scores):
+        # 选择top-k最难的负样本
+        hard_scores, _ = torch.topk(scores, k=self.topk, dim=1)
+        return super()._compute_negative_loss(hard_scores)
+
+动态温度调整
+class AdaptiveTemperatureLoss(RankingOptimizedLoss):
+    def __init__(self, init_temp=0.1):
+        super().__init__(temperature=init_temp)
+        self.temperature = nn.Parameter(torch.tensor(init_temp))
+        
+    def forward(self, pos_scores, neg_scores):
+        # 限制温度值范围
+        self.temperature.data.clamp_(min=1e-4, max=1.0)
+        return super().forward(pos_scores, neg_scores)
+
+多任务加权策略
+class DynamicWeightLoss(nn.Module):
+    def __init__(self, num_tasks=2):
+        super().__init__()
+        self.weights = nn.Parameter(torch.ones(num_tasks))
+        
+    def forward(self, losses):
+        # 自动学习任务权重
+        norm_weights = F.softmax(self.weights, dim=0)
+        return sum(w * l for w, l in zip(norm_weights, losses))
+
