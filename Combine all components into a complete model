@@ -1,0 +1,218 @@
+import torch
+import torch.nn as nn
+from transformers import BertModel, BertTokenizer, BertConfig
+
+class OptimizedTwinTower(nn.Module):
+    """完整的优化双塔检索模型"""
+    def __init__(self, 
+                 bert_model='bert-base-uncased',
+                 hidden_dim=768,
+                 num_layers=6,
+                 num_heads=12,
+                 dropout=0.1,
+                 lambda_weight=0.8):
+        super().__init__()
+        
+        # 初始化基础组件
+        self.bert_config = BertConfig.from_pretrained(bert_model)
+        self.tokenizer = BertTokenizer.from_pretrained(bert_model)
+        
+        # 文档编码器
+        self.doc_bert = BertModel.from_pretrained(bert_model)
+        self.doc_encoder = nn.ModuleList([
+            BertEncoder(self.bert_config) for _ in range(num_layers)
+        ])
+        
+        # 查询编码器
+        self.query_bert = BertModel.from_pretrained(bert_model)
+        
+        # 查询学习模块
+        self.query_learner = QueryLearningLayer(
+            hidden_dim=hidden_dim,
+            num_layers=num_layers,
+            n_heads=num_heads,
+            dropout=dropout
+        )
+        
+        # 早期交互模块
+        self.early_interaction = EarlyInteractionLayer(
+            config={
+                'hidden_dim': hidden_dim,
+                'num_heads': num_heads,
+                'dropout': dropout
+            }
+        )
+        
+        # 投影层
+        self.doc_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.query_proj = nn.Linear(hidden_dim, hidden_dim)
+        
+        # 损失函数参数
+        self.lambda_weight = lambda_weight
+        self.recon_loss = nn.CrossEntropyLoss()
+        
+        # 初始化权重
+        self._init_weights()
+
+    def _init_weights(self):
+        """自定义权重初始化"""
+        nn.init.xavier_uniform_(self.doc_proj.weight)
+        nn.init.xavier_uniform_(self.query_proj.weight)
+        nn.init.constant_(self.doc_proj.bias, 0.)
+        nn.init.constant_(self.query_proj.bias, 0.)
+
+    def encode_document(self, doc_input):
+        """文档编码流程"""
+        # BERT基础编码
+        doc_embeds = self.doc_bert(**doc_input).last_hidden_state
+        
+        # 深度编码
+        for layer in self.doc_encoder:
+            doc_embeds = layer(doc_embeds)
+            
+        return self.doc_proj(doc_embeds)
+
+    def encode_query(self, query_input):
+        """查询编码流程"""
+        query_embeds = self.query_bert(**query_input).last_hidden_state
+        return self.query_proj(query_embeds[:, 0, :])  # CLS pooling
+
+    def forward(self, doc_input, query_input):
+        """完整前向计算"""
+        # 文档编码
+        doc_embeds = self.encode_document(doc_input)
+        
+        # 生成模拟查询
+        pseudo_queries = self.query_learner(
+            doc_embeds, 
+            doc_input['attention_mask']
+        )
+        
+        # 早期交互
+        enhanced_doc = self.early_interaction(
+            doc_embeds, 
+            pseudo_queries,
+            doc_input['attention_mask']
+        )
+        
+        # 真实查询编码
+        real_query = self.encode_query(query_input)
+        
+        # 相似度计算
+        doc_repr = enhanced_doc.mean(dim=1)  # 平均池化
+        scores = torch.matmul(doc_repr, real_query.t())
+        
+        return scores, pseudo_queries
+
+    def compute_loss(self, scores, pseudo_queries, labels):
+        """综合损失计算"""
+        batch_size = scores.size(0)
+        
+        # 正样本分数（对角线元素）
+        pos_scores = scores.diag().unsqueeze(1)
+        
+        # 负样本分数（非对角线元素）
+        neg_mask = ~torch.eye(batch_size, dtype=torch.bool, device=scores.device)
+        neg_scores = scores[neg_mask].view(batch_size, batch_size-1)
+        
+        # 排名损失
+        ranking_loss = torch.mean(
+            torch.log(1 + torch.exp(-pos_scores/0.1)) + \
+            torch.mean(torch.log(1 + torch.exp(neg_scores/0.1))
+        
+        # 查询重构损失（示例实现）
+        recon_loss = self.recon_loss(
+            pseudo_queries.view(-1, pseudo_queries.size(-1)),
+            labels['recon_labels'].view(-1)
+        )
+        
+        # 组合损失
+        total_loss = self.lambda_weight * ranking_loss + \
+                    (1 - self.lambda_weight) * recon_loss
+        
+        return {
+            'total_loss': total_loss,
+            'ranking_loss': ranking_loss,
+            'recon_loss': recon_loss
+        }
+
+class BertEncoder(nn.Module):
+    """自定义BERT编码层"""
+    def __init__(self, config):
+        super().__init__()
+        self.layer = nn.ModuleList([
+            BertLayer(config) for _ in range(config.num_hidden_layers)
+        ])
+        
+    def forward(self, hidden_states):
+        for layer_module in self.layer:
+            hidden_states = layer_module(hidden_states)
+        return hidden_states
+
+# 测试代码 ---------------------------------------------------
+if __name__ == "__main__":
+    # 初始化模型
+    model = OptimizedTwinTower()
+    tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
+    
+    # 模拟输入
+    docs = ["This is a sample document.", "Another example document."]
+    queries = ["Sample query", "Another test query"]
+    
+    # Tokenization
+    doc_input = tokenizer(docs, padding=True, truncation=True, max_length=512, return_tensors='pt')
+    query_input = tokenizer(queries, padding=True, truncation=True, max_length=64, return_tensors='pt')
+    
+    # 前向传播
+    scores, pseudo_queries = model(doc_input, query_input)
+    
+    # 模拟标签
+    labels = {
+        'recon_labels': torch.randint(0, tokenizer.vocab_size, (2, 64))
+    }
+    
+    # 计算损失
+    loss_dict = model.compute_loss(scores, pseudo_queries, labels)
+    
+    print("模型输出形状:")
+    print(f"相似度矩阵: {scores.shape}")          # [2, 2]
+    print(f"模拟查询形状: {pseudo_queries.shape}") # [2, 64, 768]
+    
+    print("\n损失值:")
+    for k, v in loss_dict.items():
+        print(f"{k}: {v.item():.4f}")
+
+混合精度训练
+from torch.cuda.amp import autocast, GradScaler
+
+scaler = GradScaler()
+
+with autocast():
+    scores, pseudo_queries = model(doc_input, query_input)
+    loss = model.compute_loss(...)
+
+scaler.scale(loss).backward()
+scaler.step(optimizer)
+scaler.update()
+
+梯度积累
+accumulation_steps = 4
+optimizer.zero_grad()
+
+for i, batch in enumerate(dataloader):
+    loss = forward_and_compute_loss(batch)
+    scaler.scale(loss).backward()
+    
+    if (i+1) % accumulation_steps == 0:
+        scaler.step(optimizer)
+        scaler.update()
+        optimizer.zero_grad()
+
+分布式训练
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+
+# 初始化进程组
+dist.init_process_group(backend='nccl')
+model = DDP(model.to(device), device_ids=[local_rank])
+
