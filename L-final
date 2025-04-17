@@ -1,0 +1,12 @@
+# Ranking loss implementation (simplified)
+def ranking_loss(pos_scores, neg_scores, temperature=0.5):
+    numerator = torch.exp(pos_scores / temperature)
+    denominator = numerator + torch.sum(torch.exp(neg_scores / temperature), dim=-1)
+    return -torch.log(numerator / denominator).mean()
+
+# Query reconstruction loss
+def mse_loss(sim_query, real_query):
+    return torch.mean((sim_query - real_query) ** 2)
+
+# Total loss
+total_loss = ranking_loss(pos, neg) + 0.8 * mse_loss(q_sim, q_real)
